@@ -5,17 +5,18 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import argparse
 import json
 import random
-import argparse
 
-from src.slurm import init_signal_handler, init_distributed_mode
 from src.data.loader import check_data_params, load_data
-from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order
+from src.evaluation.evaluator import Evaluator
 from src.model import check_model_params, build_model
 from src.model.memory import HashingMemory
-from src.trainer import SingleTrainer, EncDecTrainer
-from src.evaluation.evaluator import SingleEvaluator, EncDecEvaluator
+from src.slurm import init_signal_handler, init_distributed_mode
+from src.trainer import Trainer
+from src.utils import bool_flag, initialize_exp, set_sampling_probs
+
 
 # python train.py
 #
@@ -265,18 +266,11 @@ def main(params):
     data = load_data(params)
 
     # build model
-    if params.encoder_only:
-        model = build_model(params, data['dico'])
-    else:
-        encoder, decoder = build_model(params, data['dico'])
+    model = build_model(params, data['dico'])
 
     # build trainer, reload potential checkpoints / build evaluator
-    if params.encoder_only:
-        trainer = SingleTrainer(model, data, params)
-        evaluator = SingleEvaluator(trainer, data, params)
-    else:
-        trainer = EncDecTrainer(encoder, decoder, data, params)
-        evaluator = EncDecEvaluator(trainer, data, params)
+    trainer = Trainer(model, data, params)
+    evaluator = Evaluator(trainer, data, params)
 
     # evaluation
     if params.eval_only:
@@ -297,30 +291,8 @@ def main(params):
         trainer.n_sentences = 0
 
         while trainer.n_sentences < trainer.epoch_size:
-
-            # CLM steps
-            for lang1, lang2 in shuf_order(params.clm_steps, params):
-                trainer.clm_step(lang1, lang2, params.lambda_clm)
-
-            # MLM steps (also includes TLM if lang2 is not None)
-            for lang1, lang2 in shuf_order(params.mlm_steps, params):
-                trainer.mlm_step(lang1, lang2, params.lambda_mlm)
-
-            # parallel classification steps
-            for lang1, lang2 in shuf_order(params.pc_steps, params):
-                trainer.pc_step(lang1, lang2, params.lambda_pc)
-
-            # denoising auto-encoder steps
-            for lang in shuf_order(params.ae_steps):
-                trainer.mt_step(lang, lang, params.lambda_ae)
-
-            # machine translation steps
-            for lang1, lang2 in shuf_order(params.mt_steps, params):
-                trainer.mt_step(lang1, lang2, params.lambda_mt)
-
-            # back-translation steps
-            for lang1, lang2, lang3 in shuf_order(params.bt_steps):
-                trainer.bt_step(lang1, lang2, lang3, params.lambda_bt)
+            # MLM steps
+            trainer.mlm_step(params.lambda_mlm)
 
             trainer.iter()
 

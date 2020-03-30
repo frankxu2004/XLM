@@ -29,10 +29,18 @@ logger = getLogger()
 
 class Trainer(object):
 
-    def __init__(self, data, params):
+    def __init__(self, model, data, params):
         """
         Initialize trainer.
         """
+        self.MODEL_NAMES = ['model']
+
+        # model / data / params
+        self.model = model
+        self.data = data
+        self.params = params
+
+
         # epoch / iteration size
         self.epoch_size = params.epoch_size
         if self.epoch_size == -1:
@@ -55,7 +63,7 @@ class Trainer(object):
         self.set_parameters()
 
         # float16 / distributed (no AMP)
-        assert params.amp >= 1 or not params.fp16
+        # assert params.amp >= 1 or not params.fp16
         assert params.amp >= 0 or params.accumulate_gradients == 1
         if params.multi_gpu and params.amp == -1:
             logger.info("Using nn.parallel.DistributedDataParallel ...")
@@ -91,7 +99,7 @@ class Trainer(object):
         # probability of masking out / randomize / not modify words to predict
         params.pred_probs = torch.FloatTensor([params.word_mask, params.word_keep, params.word_rand])
 
-        # probabilty to predict a word
+        # probability to predict a word
         counts = np.array(list(self.data['dico'].counts.values()))
         params.mask_scores = np.maximum(counts, 1) ** -params.sample_alpha
         params.mask_scores[params.pad_index] = 0  # do not predict <PAD> index
@@ -111,17 +119,7 @@ class Trainer(object):
         self.n_total_iter = 0
         self.n_sentences = 0
         self.stats = OrderedDict(
-            [('processed_s', 0), ('processed_w', 0)] +
-            [('CLM-%s' % l, []) for l in params.langs] +
-            [('CLM-%s-%s' % (l1, l2), []) for l1, l2 in data['para'].keys()] +
-            [('CLM-%s-%s' % (l2, l1), []) for l1, l2 in data['para'].keys()] +
-            [('MLM-%s' % l, []) for l in params.langs] +
-            [('MLM-%s-%s' % (l1, l2), []) for l1, l2 in data['para'].keys()] +
-            [('MLM-%s-%s' % (l2, l1), []) for l1, l2 in data['para'].keys()] +
-            [('PC-%s-%s' % (l1, l2), []) for l1, l2 in params.pc_steps] +
-            [('AE-%s' % lang, []) for lang in params.ae_steps] +
-            [('MT-%s-%s' % (l1, l2), []) for l1, l2 in params.mt_steps] +
-            [('BT-%s-%s-%s' % (l1, l2, l3), []) for l1, l2, l3 in params.bt_steps]
+            [('processed_s', 0), ('processed_w', 0), ('MLM', [])]
         )
         self.last_time = time.time()
 
@@ -282,49 +280,37 @@ class Trainer(object):
         # log speed + stats + learning rate
         logger.info(s_iter + s_speed + s_stat + s_lr)
 
-    def get_iterator(self, iter_name, lang1, lang2, stream):
+    def get_iterator(self, iter_name, stream):
         """
         Create a new iterator for a dataset.
         """
-        logger.info("Creating new training data iterator (%s) ..." % ','.join([str(x) for x in [iter_name, lang1, lang2] if x is not None]))
+        logger.info("Creating new training data iterator (%s) ..." % iter_name)
         assert stream or not self.params.use_memory or not self.params.mem_query_batchnorm
-        if lang2 is None:
-            if stream:
-                iterator = self.data['mono_stream'][lang1]['train'].get_iterator(shuffle=True)
-            else:
-                iterator = self.data['mono'][lang1]['train'].get_iterator(
-                    shuffle=True,
-                    group_by_size=self.params.group_by_size,
-                    n_sentences=-1,
-                )
+        if stream:
+            iterator = self.data['mono_stream']['en']['train'].get_iterator(shuffle=True)
         else:
-            assert stream is False
-            _lang1, _lang2 = (lang1, lang2) if lang1 < lang2 else (lang2, lang1)
-            iterator = self.data['para'][(_lang1, _lang2)]['train'].get_iterator(
+            iterator = self.data['mono']['en']['train'].get_iterator(
                 shuffle=True,
                 group_by_size=self.params.group_by_size,
                 n_sentences=-1,
             )
 
-        self.iterators[(iter_name, lang1, lang2)] = iterator
+        self.iterators[iter_name] = iterator
         return iterator
 
-    def get_batch(self, iter_name, lang1, lang2=None, stream=False):
+    def get_batch(self, iter_name, stream=False):
         """
         Return a batch of sentences from a dataset.
         """
-        assert lang1 in self.params.langs
-        assert lang2 is None or lang2 in self.params.langs
-        assert stream is False or lang2 is None
-        iterator = self.iterators.get((iter_name, lang1, lang2), None)
+        iterator = self.iterators.get(iter_name, None)
         if iterator is None:
-            iterator = self.get_iterator(iter_name, lang1, lang2, stream)
+            iterator = self.get_iterator(iter_name, stream)
         try:
             x = next(iterator)
         except StopIteration:
-            iterator = self.get_iterator(iter_name, lang1, lang2, stream)
+            iterator = self.get_iterator(iter_name, stream)
             x = next(iterator)
-        return x if lang2 is None or lang1 < lang2 else x[::-1]
+        return x
 
     def word_shuffle(self, x, l):
         """
@@ -467,28 +453,17 @@ class Trainer(object):
 
         return x, _x_real, pred_mask
 
-    def generate_batch(self, lang1, lang2, name):
+    def generate_batch(self, name):
         """
         Prepare a batch (for causal or non-causal mode).
         """
         params = self.params
-        lang1_id = params.lang2id[lang1]
-        lang2_id = params.lang2id[lang2] if lang2 is not None else None
 
-        if lang2 is None:
-            x, lengths = self.get_batch(name, lang1, stream=True)
-            positions = None
-            langs = x.clone().fill_(lang1_id) if params.n_langs > 1 else None
-        elif lang1 == lang2:
-            (x1, len1) = self.get_batch(name, lang1)
-            (x2, len2) = (x1, len1)
-            (x1, len1) = self.add_noise(x1, len1)
-            x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
-        else:
-            (x1, len1), (x2, len2) = self.get_batch(name, lang1, lang2)
-            x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=True)
+        x, lengths = self.get_batch(name, stream=True)
+        positions = None
+        langs = None
 
-        return x, lengths, positions, langs, (None, None) if lang2 is None else (len1, len2)
+        return x, lengths, positions, langs, (None, None)
 
     def save_checkpoint(self, name, include_optimizers=True):
         """
@@ -654,61 +629,20 @@ class Trainer(object):
         assert x.size(1) % 8 == 0
         return x, lengths, positions, langs, idx
 
-    def clm_step(self, lang1, lang2, lambda_coeff):
-        """
-        Next word prediction step (causal prediction).
-        CLM objective.
-        """
-        assert lambda_coeff >= 0
-        if lambda_coeff == 0:
-            return
-        params = self.params
-        name = 'model' if params.encoder_only else 'decoder'
-        model = getattr(self, name)
-        model.train()
-
-        # generate batch / select words to predict
-        x, lengths, positions, langs, _ = self.generate_batch(lang1, lang2, 'causal')
-        x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
-        alen = torch.arange(lengths.max(), dtype=torch.long, device=lengths.device)
-        pred_mask = alen[:, None] < lengths[None] - 1
-        if params.context_size > 0:  # do not predict without context
-            pred_mask[:params.context_size] = 0
-        y = x[1:].masked_select(pred_mask[:-1])
-        assert pred_mask.sum().item() == y.size(0)
-
-        # cuda
-        x, lengths, langs, pred_mask, y = to_cuda(x, lengths, langs, pred_mask, y)
-
-        # forward / loss
-        tensor = model('fwd', x=x, lengths=lengths, langs=langs, causal=True)
-        _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
-        self.stats[('CLM-%s' % lang1) if lang2 is None else ('CLM-%s-%s' % (lang1, lang2))].append(loss.item())
-        loss = lambda_coeff * loss
-
-        # optimize
-        self.optimize(loss)
-
-        # number of processed sentences / words
-        self.n_sentences += params.batch_size
-        self.stats['processed_s'] += lengths.size(0)
-        self.stats['processed_w'] += pred_mask.sum().item()
-
-    def mlm_step(self, lang1, lang2, lambda_coeff):
+    def mlm_step(self, lambda_coeff):
         """
         Masked word prediction step.
-        MLM objective is lang2 is None, TLM objective otherwise.
         """
         assert lambda_coeff >= 0
         if lambda_coeff == 0:
             return
         params = self.params
-        name = 'model' if params.encoder_only else 'encoder'
+        name = 'model'
         model = getattr(self, name)
         model.train()
 
         # generate batch / select words to predict
-        x, lengths, positions, langs, _ = self.generate_batch(lang1, lang2, 'pred')
+        x, lengths, positions, langs, _ = self.generate_batch('pred')
         x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
         x, y, pred_mask = self.mask_out(x, lengths)
 
@@ -718,7 +652,7 @@ class Trainer(object):
         # forward / loss
         tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
         _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
-        self.stats[('MLM-%s' % lang1) if lang2 is None else ('MLM-%s-%s' % (lang1, lang2))].append(loss.item())
+        self.stats['MLM'].append(loss.item())
         loss = lambda_coeff * loss
 
         # optimize
@@ -728,208 +662,3 @@ class Trainer(object):
         self.n_sentences += params.batch_size
         self.stats['processed_s'] += lengths.size(0)
         self.stats['processed_w'] += pred_mask.sum().item()
-
-    def pc_step(self, lang1, lang2, lambda_coeff):
-        """
-        Parallel classification step. Predict if pairs of sentences are mutual translations of each other.
-        """
-        assert lambda_coeff >= 0
-        if lambda_coeff == 0:
-            return
-        params = self.params
-        name = 'model' if params.encoder_only else 'encoder'
-        model = getattr(self, name)
-        model.train()
-
-        lang1_id = params.lang2id[lang1]
-        lang2_id = params.lang2id[lang2]
-
-        # sample parallel sentences
-        (x1, len1), (x2, len2) = self.get_batch('align', lang1, lang2)
-        bs = len1.size(0)
-        if bs == 1:  # can happen (although very rarely), which makes the negative loss fail
-            self.n_sentences += params.batch_size
-            return
-
-        # associate lang1 sentences with their translations, and random lang2 sentences
-        y = torch.LongTensor(bs).random_(2)
-        idx_pos = torch.arange(bs)
-        idx_neg = ((idx_pos + torch.LongTensor(bs).random_(1, bs)) % bs)
-        idx = (y == 1).long() * idx_pos + (y == 0).long() * idx_neg
-        x2, len2 = x2[:, idx], len2[idx]
-
-        # generate batch / cuda
-        x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
-        x, lengths, positions, langs, new_idx = self.round_batch(x, lengths, positions, langs)
-        if new_idx is not None:
-            y = y[new_idx]
-        x, lengths, positions, langs = to_cuda(x, lengths, positions, langs)
-
-        # get sentence embeddings
-        h = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)[0]
-
-        # parallel classification loss
-        CLF_ID1, CLF_ID2 = 8, 9  # very hacky, use embeddings to make weights for the classifier
-        emb = (model.module if params.multi_gpu else model).embeddings.weight
-        pred = F.linear(h, emb[CLF_ID1].unsqueeze(0), emb[CLF_ID2, 0])
-        loss = F.binary_cross_entropy_with_logits(pred.view(-1), y.to(pred.device).type_as(pred))
-        self.stats['PC-%s-%s' % (lang1, lang2)].append(loss.item())
-        loss = lambda_coeff * loss
-
-        # optimize
-        self.optimize(loss)
-
-        # number of processed sentences / words
-        self.n_sentences += params.batch_size
-        self.stats['processed_s'] += bs
-        self.stats['processed_w'] += lengths.sum().item()
-
-
-class SingleTrainer(Trainer):
-
-    def __init__(self, model, data, params):
-
-        self.MODEL_NAMES = ['model']
-
-        # model / data / params
-        self.model = model
-        self.data = data
-        self.params = params
-
-        super().__init__(data, params)
-
-
-class EncDecTrainer(Trainer):
-
-    def __init__(self, encoder, decoder, data, params):
-
-        self.MODEL_NAMES = ['encoder', 'decoder']
-
-        # model / data / params
-        self.encoder = encoder
-        self.decoder = decoder
-        self.data = data
-        self.params = params
-
-        super().__init__(data, params)
-
-    def mt_step(self, lang1, lang2, lambda_coeff):
-        """
-        Machine translation step.
-        Can also be used for denoising auto-encoding.
-        """
-        assert lambda_coeff >= 0
-        if lambda_coeff == 0:
-            return
-        params = self.params
-        self.encoder.train()
-        self.decoder.train()
-
-        lang1_id = params.lang2id[lang1]
-        lang2_id = params.lang2id[lang2]
-
-        # generate batch
-        if lang1 == lang2:
-            (x1, len1) = self.get_batch('ae', lang1)
-            (x2, len2) = (x1, len1)
-            (x1, len1) = self.add_noise(x1, len1)
-        else:
-            (x1, len1), (x2, len2) = self.get_batch('mt', lang1, lang2)
-        langs1 = x1.clone().fill_(lang1_id)
-        langs2 = x2.clone().fill_(lang2_id)
-
-        # target words to predict
-        alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
-        pred_mask = alen[:, None] < len2[None] - 1  # do not predict anything given the last target word
-        y = x2[1:].masked_select(pred_mask[:-1])
-        assert len(y) == (len2 - 1).sum().item()
-
-        # cuda
-        x1, len1, langs1, x2, len2, langs2, y = to_cuda(x1, len1, langs1, x2, len2, langs2, y)
-
-        # encode source sentence
-        enc1 = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
-        enc1 = enc1.transpose(0, 1)
-
-        # decode target sentence
-        dec2 = self.decoder('fwd', x=x2, lengths=len2, langs=langs2, causal=True, src_enc=enc1, src_len=len1)
-
-        # loss
-        _, loss = self.decoder('predict', tensor=dec2, pred_mask=pred_mask, y=y, get_scores=False)
-        self.stats[('AE-%s' % lang1) if lang1 == lang2 else ('MT-%s-%s' % (lang1, lang2))].append(loss.item())
-        loss = lambda_coeff * loss
-
-        # optimize
-        self.optimize(loss)
-
-        # number of processed sentences / words
-        self.n_sentences += params.batch_size
-        self.stats['processed_s'] += len2.size(0)
-        self.stats['processed_w'] += (len2 - 1).sum().item()
-
-    def bt_step(self, lang1, lang2, lang3, lambda_coeff):
-        """
-        Back-translation step for machine translation.
-        """
-        assert lambda_coeff >= 0
-        if lambda_coeff == 0:
-            return
-        assert lang1 == lang3 and lang1 != lang2 and lang2 is not None
-        params = self.params
-        _encoder = self.encoder.module if params.multi_gpu else self.encoder
-        _decoder = self.decoder.module if params.multi_gpu else self.decoder
-
-        lang1_id = params.lang2id[lang1]
-        lang2_id = params.lang2id[lang2]
-
-        # generate source batch
-        x1, len1 = self.get_batch('bt', lang1)
-        langs1 = x1.clone().fill_(lang1_id)
-
-        # cuda
-        x1, len1, langs1 = to_cuda(x1, len1, langs1)
-
-        # generate a translation
-        with torch.no_grad():
-
-            # evaluation mode
-            self.encoder.eval()
-            self.decoder.eval()
-
-            # encode source sentence and translate it
-            enc1 = _encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
-            enc1 = enc1.transpose(0, 1)
-            x2, len2 = _decoder.generate(enc1, len1, lang2_id, max_len=int(1.3 * len1.max().item() + 5))
-            langs2 = x2.clone().fill_(lang2_id)
-
-            # free CUDA memory
-            del enc1
-
-            # training mode
-            self.encoder.train()
-            self.decoder.train()
-
-        # encode generate sentence
-        enc2 = self.encoder('fwd', x=x2, lengths=len2, langs=langs2, causal=False)
-        enc2 = enc2.transpose(0, 1)
-
-        # words to predict
-        alen = torch.arange(len1.max(), dtype=torch.long, device=len1.device)
-        pred_mask = alen[:, None] < len1[None] - 1  # do not predict anything given the last target word
-        y1 = x1[1:].masked_select(pred_mask[:-1])
-
-        # decode original sentence
-        dec3 = self.decoder('fwd', x=x1, lengths=len1, langs=langs1, causal=True, src_enc=enc2, src_len=len2)
-
-        # loss
-        _, loss = self.decoder('predict', tensor=dec3, pred_mask=pred_mask, y=y1, get_scores=False)
-        self.stats[('BT-%s-%s-%s' % (lang1, lang2, lang3))].append(loss.item())
-        loss = lambda_coeff * loss
-
-        # optimize
-        self.optimize(loss)
-
-        # number of processed sentences / words
-        self.n_sentences += params.batch_size
-        self.stats['processed_s'] += len1.size(0)
-        self.stats['processed_w'] += (len1 - 1).sum().item()
